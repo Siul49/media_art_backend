@@ -43,6 +43,12 @@
           <dl>
             <div><dt>Arousal Live</dt><dd id="liveArousal">-</dd></div>
             <div><dt>Arousal Confidence</dt><dd id="arousalConfidence">-</dd></div>
+            <div><dt>Valence Live</dt><dd id="liveValence">-</dd></div>
+            <div><dt>SER Backend</dt><dd id="liveSerBackend">-</dd></div>
+            <div><dt>SER Label</dt><dd id="liveSerLabel">-</dd></div>
+            <div><dt>SER Confidence</dt><dd id="liveSerConfidence">-</dd></div>
+            <div><dt>Processing</dt><dd id="liveProcessingMs">-</dd></div>
+            <div><dt>RMS</dt><dd id="liveRms">-</dd></div>
             <div><dt>Valence Confidence</dt><dd id="valenceConfidence">-</dd></div>
           </dl>
         </article>
@@ -124,6 +130,62 @@
         <pre id="virtualRaw" class="virtual-raw">{}</pre>
       </section>
 
+      <section class="evaluation-section" data-testid="ser-evaluation">
+        <div class="evaluation-head">
+          <div>
+            <p class="label">SER Evaluation</p>
+            <h2>내가 느낀 정답 기록</h2>
+          </div>
+          <p id="evaluationSummary" class="mono">0 samples</p>
+        </div>
+        <div class="evaluation-actions">
+          <button type="button" data-eval-label="ang">실제: ang</button>
+          <button type="button" data-eval-label="sad">실제: sad</button>
+          <button type="button" data-eval-label="neu">실제: neu</button>
+          <button type="button" data-eval-label="hap">실제: hap</button>
+        </div>
+        <div id="evaluationList" class="evaluation-list"></div>
+      </section>
+
+      <section class="evaluation-section" data-testid="parent-training">
+        <div class="evaluation-head">
+          <div>
+            <p class="label">Parent Training Mode</p>
+            <h2>팀원 목소리로 초기 기억 만들기</h2>
+          </div>
+          <p id="parentSummary" class="mono">0 parent samples</p>
+        </div>
+        <div class="evaluation-actions">
+          <input id="parentSpeakerInput" type="text" value="team" aria-label="speaker name">
+          <button type="button" data-parent-label="ang">부모: ang</button>
+          <button type="button" data-parent-label="sad">부모: sad</button>
+          <button type="button" data-parent-label="neu">부모: neu</button>
+          <button type="button" data-parent-label="hap">부모: hap</button>
+        </div>
+        <div id="parentList" class="evaluation-list"></div>
+      </section>
+
+      <section class="evaluation-section" data-testid="visitor-memory">
+        <div class="evaluation-head">
+          <div>
+            <p class="label">Visitor Memory</p>
+            <h2>관객 목소리로 자라는 공간 분위기</h2>
+          </div>
+          <p id="visitorSummary" class="mono">0 visitor samples</p>
+        </div>
+        <div id="visitorList" class="evaluation-list"></div>
+      </section>
+
+      <section class="evaluation-section" data-testid="genome-memory">
+        <div class="evaluation-head">
+          <div>
+            <p class="label">Genome</p>
+            <h2>천천히 진화하는 조명 성격</h2>
+          </div>
+          <p id="genomeSummary" class="mono">genome pending</p>
+        </div>
+      </section>
+
       <section class="debug-section" data-testid="debug-console">
         <div class="debug-head">
           <div>
@@ -194,7 +256,7 @@
         <pre id="raw">{}</pre>
       </section>
     </main>
-    <script src="./led_preview_model.js?v=linear-bidirectional-preview"></script>
-    <script src="./app.js?v=debug-console"></script>
+    <script src="./led_preview_model.js?v=quadrant-test-preview"></script>
+    <script src="./app.js?v=parent-training"></script>
   </body>
 </html>

@@ -10,6 +10,12 @@ const valence = document.querySelector("#valence");
 const arousal = document.querySelector("#arousal");
 const liveArousal = document.querySelector("#liveArousal");
 const arousalConfidence = document.querySelector("#arousalConfidence");
+const liveValence = document.querySelector("#liveValence");
+const liveSerBackend = document.querySelector("#liveSerBackend");
+const liveSerLabel = document.querySelector("#liveSerLabel");
+const liveSerConfidence = document.querySelector("#liveSerConfidence");
+const liveProcessingMs = document.querySelector("#liveProcessingMs");
+const liveRms = document.querySelector("#liveRms");
 const valenceConfidence = document.querySelector("#valenceConfidence");
 const rgb = document.querySelector("#rgb");
 const raw = document.querySelector("#raw");
@@ -46,6 +52,16 @@ const debugSerialText = document.querySelector("#debugSerialText");
 const debugMicText = document.querySelector("#debugMicText");
 const debugRaw = document.querySelector("#debugRaw");
 const ledPreviewModel = window.InnerworldLedPreview;
+const evaluationSummary = document.querySelector("#evaluationSummary");
+const evaluationList = document.querySelector("#evaluationList");
+const evaluationButtons = document.querySelectorAll("[data-eval-label]");
+const parentSummary = document.querySelector("#parentSummary");
+const parentList = document.querySelector("#parentList");
+const parentButtons = document.querySelectorAll("[data-parent-label]");
+const parentSpeakerInput = document.querySelector("#parentSpeakerInput");
+const visitorSummary = document.querySelector("#visitorSummary");
+const visitorList = document.querySelector("#visitorList");
+const genomeSummary = document.querySelector("#genomeSummary");
 
 let pollTimer = null;
 let livePollTimer = null;
@@ -213,6 +229,131 @@ async function debugPost(path, body = {}) {
     throw new Error(payload.error || `${path} failed: ${response.status}`);
   }
   return payload;
+}
+
+function renderEvaluation(payload) {
+  if (!evaluationSummary || !evaluationList) {
+    return;
+  }
+  const accuracy = payload.accuracy === null || payload.accuracy === undefined
+    ? "-"
+    : `${Math.round(payload.accuracy * 100)}%`;
+  evaluationSummary.textContent = `${payload.count || 0} samples / accuracy ${accuracy}`;
+  evaluationList.innerHTML = "";
+  for (const sample of [...(payload.samples || [])].reverse()) {
+    const row = document.createElement("div");
+    row.className = "evaluation-row";
+    row.dataset.correct = sample.correct ? "true" : "false";
+    row.textContent = `정답 ${sample.expected_label} / 예측 ${sample.predicted_label} / val ${fmt(sample.valence_live)} / conf ${fmt(sample.ser_confidence)}`;
+    evaluationList.appendChild(row);
+  }
+}
+
+function renderParentMemory(payload) {
+  if (!parentSummary || !parentList) {
+    return;
+  }
+  const accuracy = payload.accuracy === null || payload.accuracy === undefined
+    ? "-"
+    : `${Math.round(payload.accuracy * 100)}%`;
+  parentSummary.textContent = `${payload.count || 0} parent samples / accuracy ${accuracy}`;
+  parentList.innerHTML = "";
+  for (const sample of [...(payload.samples || [])].reverse()) {
+    const row = document.createElement("div");
+    row.className = "evaluation-row";
+    row.dataset.correct = sample.correct ? "true" : "false";
+    row.textContent = `${sample.speaker || "team"} / 정답 ${sample.expected_label} / 예측 ${sample.predicted_label} / val ${fmt(sample.valence_live)} / conf ${fmt(sample.ser_confidence)}`;
+    parentList.appendChild(row);
+  }
+}
+
+function renderVisitorMemory(payload) {
+  if (!visitorSummary || !visitorList) {
+    return;
+  }
+  const mood = payload.mood || {};
+  visitorSummary.textContent = `${payload.count || 0} visitor samples / mood val ${fmt(mood.valence)} / ar ${fmt(mood.arousal)}`;
+  visitorList.innerHTML = "";
+  for (const sample of [...(payload.samples || [])].reverse()) {
+    const row = document.createElement("div");
+    row.className = "evaluation-row";
+    row.textContent = `예측 ${sample.label} / val ${fmt(sample.valence)} / ar ${fmt(sample.arousal)} / conf ${fmt(sample.confidence)}`;
+    visitorList.appendChild(row);
+  }
+}
+
+async function loadEvaluation() {
+  const response = await fetch("/api/evaluation");
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || `evaluation load failed: ${response.status}`);
+  }
+  renderEvaluation(payload);
+}
+
+async function recordEvaluation(expectedLabel) {
+  const response = await fetch("/api/evaluation/record", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ expectedLabel }),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || `evaluation record failed: ${response.status}`);
+  }
+  renderEvaluation(payload);
+}
+
+async function loadParentMemory() {
+  const response = await fetch("/api/parent-memory");
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || `parent memory load failed: ${response.status}`);
+  }
+  renderParentMemory(payload);
+}
+
+async function recordParentMemory(expectedLabel) {
+  const response = await fetch("/api/parent-memory/record", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      expectedLabel,
+      speaker: parentSpeakerInput?.value || "team",
+    }),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || `parent memory record failed: ${response.status}`);
+  }
+  renderParentMemory(payload);
+  renderEvaluation(payload);
+}
+
+async function loadVisitorMemory() {
+  const response = await fetch("/api/visitor-memory");
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || `visitor memory load failed: ${response.status}`);
+  }
+  renderVisitorMemory(payload);
+}
+
+function renderGenome(payload) {
+  if (!genomeSummary) {
+    return;
+  }
+  const genome = payload.genome || {};
+  genomeSummary.textContent = `ar atk ${fmt(genome.arousal_attack)} / ar rel ${fmt(genome.arousal_release)} / visitor bias ${fmt(genome.visitor_bias_strength)}`;
+}
+
+async function loadGenome() {
+  const response = await fetch("/api/genome");
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || `genome load failed: ${response.status}`);
+  }
+  renderGenome(payload);
 }
 
 async function runDebugAction(label, action) {
@@ -524,6 +665,14 @@ function renderLiveState(state) {
   if (state.latest) {
     liveArousal.textContent = fmt(state.latest.arousal_live);
     arousalConfidence.textContent = fmt(state.latest.arousal_confidence);
+    liveValence.textContent = fmt(state.latest.valence_target);
+    liveSerBackend.textContent = state.latest.ser_backend || "-";
+    liveSerLabel.textContent = state.latest.ser_label || "-";
+    liveSerConfidence.textContent = fmt(state.latest.ser_confidence);
+    liveProcessingMs.textContent = typeof state.latest.processing_ms === "number"
+      ? `${state.latest.processing_ms.toFixed(3)} ms`
+      : "-";
+    liveRms.textContent = fmt(state.latest.rms);
   }
   if (state.result) {
     renderResult(state.result);
@@ -721,6 +870,26 @@ if (debugAudioProbeButton) {
   });
 }
 
+for (const button of evaluationButtons) {
+  button.addEventListener("click", () => {
+    recordEvaluation(button.dataset.evalLabel).catch((error) => {
+      if (evaluationSummary) {
+        evaluationSummary.textContent = error.message;
+      }
+    });
+  });
+}
+
+for (const button of parentButtons) {
+  button.addEventListener("click", () => {
+    recordParentMemory(button.dataset.parentLabel).catch((error) => {
+      if (parentSummary) {
+        parentSummary.textContent = error.message;
+      }
+    });
+  });
+}
+
 buildControllerPreview();
 buildArduinoHardwarePreview();
 renderLedPreviewFromState({});
@@ -738,6 +907,30 @@ loadVirtualMicScenarios()
       virtualStatusText.textContent = error.message;
     }
   });
+loadEvaluation().catch((error) => {
+  if (evaluationSummary) {
+    evaluationSummary.textContent = error.message;
+  }
+});
+loadParentMemory().catch((error) => {
+  if (parentSummary) {
+    parentSummary.textContent = error.message;
+  }
+});
+loadVisitorMemory().catch((error) => {
+  if (visitorSummary) {
+    visitorSummary.textContent = error.message;
+  }
+});
+loadGenome().catch((error) => {
+  if (genomeSummary) {
+    genomeSummary.textContent = error.message;
+  }
+});
+setInterval(() => {
+  loadVisitorMemory();
+  loadGenome();
+}, 3000);
 pollStatus();
 pollLiveStatus();
 if (debugSnapshotButton) {

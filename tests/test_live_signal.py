@@ -3,8 +3,10 @@ import unittest
 from live_signal import (
     EnvelopeSmoother,
     NoiseFloorTracker,
+    RollingVoiceBaseline,
     SegmentEndpoint,
     SpeakerBleedGate,
+    UtteranceValenceTracker,
     compose_led_mood_signal,
 )
 
@@ -67,6 +69,14 @@ class LiveSignalCoreTests(unittest.TestCase):
         self.assertEqual(result["valence"], -1.0)
         self.assertEqual(result["arousal"], 1.0)
 
+    def test_rolling_voice_baseline_reports_relative_arousal(self):
+        baseline = RollingVoiceBaseline(rms_baseline=0.02, arousal_baseline=-0.4, speech_learning_rate=0.1)
+
+        result = baseline.update(rms=0.04, arousal_live=0.0, has_signal=True)
+
+        self.assertGreater(result["relative_level"], 1.0)
+        self.assertGreater(result["relative_arousal"], 0.0)
+
 
 class SpeakerBleedGateTests(unittest.TestCase):
     def test_reference_mic_can_reduce_confidence_for_speaker_bleed(self):
@@ -109,6 +119,113 @@ class SpeakerBleedGateTests(unittest.TestCase):
         )
 
         self.assertEqual(confidence, 0.0)
+
+
+class UtteranceValenceTrackerTests(unittest.TestCase):
+    def test_holds_valence_during_utterance_and_commits_after_silence(self):
+        tracker = UtteranceValenceTracker(silence_seconds=0.9)
+
+        first = tracker.update(-0.8, 0.7, has_signal=True, now=10.0)
+        second = tracker.update(0.8, 0.9, has_signal=True, now=10.2)
+        end = tracker.update(0.0, 0.0, has_signal=False, now=11.2)
+
+        self.assertEqual(first["valence"], 0.0)
+        self.assertEqual(second["valence"], 0.0)
+        self.assertTrue(end["committed"])
+        self.assertAlmostEqual(end["valence"], 0.022)
+
+    def test_long_continuous_speech_refreshes_without_word_level_updates(self):
+        tracker = UtteranceValenceTracker(silence_seconds=0.9, max_utterance_seconds=4.0)
+
+        tracker.update(0.8, 1.0, has_signal=True, now=10.0)
+        before_refresh = tracker.update(0.8, 1.0, has_signal=True, now=13.9)
+        refresh = tracker.update(0.8, 1.0, has_signal=True, now=14.0)
+
+        self.assertFalse(before_refresh["committed"])
+        self.assertTrue(refresh["committed"])
+        self.assertAlmostEqual(refresh["valence"], 0.176)
+
+    def test_early_commits_after_three_stable_candidates(self):
+        tracker = UtteranceValenceTracker(
+            silence_seconds=0.5,
+            early_commit_min_candidates=3,
+            early_commit_min_confidence=0.6,
+        )
+
+        tracker.update(-0.8, 0.7, has_signal=True, now=10.0)
+        tracker.update(-0.7, 0.8, has_signal=True, now=10.1)
+        result = tracker.update(-0.6, 0.9, has_signal=True, now=10.2)
+
+        self.assertTrue(result["committed"])
+        self.assertLess(result["valence"], 0.0)
+
+    def test_does_not_early_commit_when_recent_signs_disagree(self):
+        tracker = UtteranceValenceTracker(
+            silence_seconds=0.5,
+            early_commit_min_candidates=3,
+            early_commit_min_confidence=0.6,
+        )
+
+        tracker.update(-0.8, 0.7, has_signal=True, now=10.0)
+        tracker.update(0.7, 0.8, has_signal=True, now=10.1)
+        result = tracker.update(-0.6, 0.9, has_signal=True, now=10.2)
+
+        self.assertFalse(result["committed"])
+        self.assertEqual(result["valence"], 0.0)
+
+    def test_opposite_short_utterance_does_not_flip_color_inside_hold_window(self):
+        tracker = UtteranceValenceTracker(
+            silence_seconds=0.5,
+            min_hold_seconds=3.0,
+            switch_min_candidates=5,
+            switch_min_confidence=0.75,
+        )
+
+        tracker.update(0.8, 0.9, has_signal=True, now=10.0)
+        tracker.update(0.8, 0.9, has_signal=True, now=10.1)
+        committed = tracker.update(0.8, 0.9, has_signal=True, now=10.2)
+        tracker.update(-0.8, 0.95, has_signal=True, now=11.0)
+        held = tracker.update(0.0, 0.0, has_signal=False, now=11.6)
+
+        self.assertTrue(committed["committed"])
+        self.assertFalse(held["committed"])
+        self.assertGreater(held["valence"], 0.0)
+
+    def test_opposite_direction_needs_strong_sustained_evidence_after_hold(self):
+        tracker = UtteranceValenceTracker(
+            silence_seconds=0.5,
+            min_hold_seconds=3.0,
+            switch_min_candidates=5,
+            switch_min_confidence=0.75,
+        )
+
+        tracker.update(0.8, 0.9, has_signal=True, now=10.0)
+        tracker.update(0.8, 0.9, has_signal=True, now=10.1)
+        tracker.update(0.8, 0.9, has_signal=True, now=10.2)
+        for offset in range(5):
+            tracker.update(-0.8, 0.9, has_signal=True, now=13.5 + (offset * 0.1))
+        switched = tracker.update(0.0, 0.0, has_signal=False, now=14.5)
+
+        self.assertTrue(switched["committed"])
+        self.assertLess(switched["valence"], 0.0)
+
+    def test_mood_score_moves_gradually_toward_repeated_same_direction(self):
+        tracker = UtteranceValenceTracker(
+            silence_seconds=0.5,
+            early_commit_min_candidates=3,
+            early_commit_min_confidence=0.6,
+            mood_attack=0.22,
+        )
+
+        tracker.update(0.8, 0.9, has_signal=True, now=10.0)
+        tracker.update(0.8, 0.9, has_signal=True, now=10.1)
+        first = tracker.update(0.8, 0.9, has_signal=True, now=10.2)
+        tracker.update(0.8, 0.9, has_signal=True, now=14.3)
+        second = tracker.update(0.0, 0.0, has_signal=False, now=14.9)
+
+        self.assertGreater(first["valence"], 0.0)
+        self.assertGreater(second["valence"], first["valence"])
+        self.assertLess(second["valence"], 0.8)
 
 
 if __name__ == "__main__":

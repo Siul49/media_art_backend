@@ -8,8 +8,8 @@ from pathlib import Path
 
 import audio_io
 import main as backend
-from live_signal import compose_led_mood_signal
-from local_ser import LocalSerRuntime
+from live_signal import EnvelopeSmoother, RollingVoiceBaseline, UtteranceValenceTracker, compose_led_mood_signal
+from local_ser import LocalSerRuntime, build_local_ser_model
 from mood_meter import clamp_mood_value, mood_payload
 from td_bridge_client import (
     OSC_IN_PATH,
@@ -26,6 +26,18 @@ HOST = "127.0.0.1"
 PORT = int(os.getenv("WEB_PORT", "8765"))
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
+MEMORY_DIR = ROOT / "memory"
+PARENT_MEMORY_PATH = MEMORY_DIR / "parent_memory.json"
+VISITOR_MEMORY_PATH = MEMORY_DIR / "visitor_memory.json"
+GENOME_PATH = MEMORY_DIR / "genome.json"
+DEFAULT_GENOME = {
+    "version": 1,
+    "arousal_attack": 0.18,
+    "arousal_release": 0.08,
+    "visitor_bias_strength": 0.18,
+    "valence_memory_attack": 0.22,
+    "valence_memory_release": 0.08,
+}
 DEBUG_OSC_PATTERNS = {
     "red_high": {"label": "red/high", "valence": -0.7, "arousal": 0.7},
     "yellow_high": {"label": "yellow/high", "valence": 0.7, "arousal": 0.7},
@@ -33,7 +45,26 @@ DEBUG_OSC_PATTERNS = {
     "green_low": {"label": "green/low", "valence": 0.7, "arousal": -0.7},
     "neutral": {"label": "neutral", "valence": 0.0, "arousal": 0.0},
 }
-local_ser_runtime = LocalSerRuntime(rate=backend.RATE, seconds=1.0)
+local_ser_runtime = LocalSerRuntime(
+    model=build_local_ser_model(
+        backend.LOCAL_SER_MODEL_ID,
+        input_rate=backend.RATE,
+        backend=backend.LOCAL_SER_BACKEND,
+    ),
+    rate=backend.RATE,
+    seconds=0.7,
+)
+live_valence_tracker = UtteranceValenceTracker(
+    silence_seconds=0.5,
+    max_utterance_seconds=4.0,
+    early_commit_min_candidates=3,
+    early_commit_min_confidence=0.6,
+    min_hold_seconds=3.0,
+    switch_min_candidates=5,
+    switch_min_confidence=0.75,
+)
+td_arousal_smoother = EnvelopeSmoother(value=0.0, attack=0.18, release=0.08)
+voice_baseline = RollingVoiceBaseline()
 
 job_lock = threading.Lock()
 job_state = {
@@ -69,6 +100,14 @@ virtual_mic_state = {
     "arousalMirrorStrategy": virtual_mic_scenarios.AROUSAL_MIRROR_STRATEGY,
 }
 
+evaluation_lock = threading.Lock()
+evaluation_samples = []
+parent_memory_lock = threading.Lock()
+visitor_memory_lock = threading.Lock()
+visitor_valence_smoother = EnvelopeSmoother(value=0.0, attack=0.025, release=0.012)
+last_visitor_memory_at = 0.0
+genome_lock = threading.Lock()
+
 
 def set_job(**updates):
     with job_lock:
@@ -101,6 +140,259 @@ def set_virtual_mic(**updates):
 def get_virtual_mic():
     with virtual_mic_lock:
         return dict(virtual_mic_state)
+
+
+def record_evaluation_sample(expected_label):
+    allowed = {"ang", "sad", "neu", "hap"}
+    label = str(expected_label or "").strip().lower()
+    if label not in allowed:
+        raise ValueError("expected_label must be one of ang, sad, neu, hap")
+
+    latest = get_live().get("latest") or {}
+    sample = {
+        "timestamp": time.time(),
+        "expected_label": label,
+        "predicted_label": str(latest.get("ser_label", "unknown")),
+        "valence_live": float(latest.get("valence_target", 0.0)),
+        "ser_confidence": float(latest.get("ser_confidence", 0.0)),
+        "arousal_live": float(latest.get("arousal_live", 0.0)),
+    }
+    sample["correct"] = sample["expected_label"] == sample["predicted_label"]
+    with evaluation_lock:
+        evaluation_samples.append(sample)
+        del evaluation_samples[:-50]
+        return sample
+
+
+def load_parent_memory():
+    if not PARENT_MEMORY_PATH.exists():
+        return {"samples": []}
+    try:
+        return json.loads(PARENT_MEMORY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"samples": []}
+
+
+def save_parent_memory(memory):
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    PARENT_MEMORY_PATH.write_text(
+        json.dumps(memory, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_visitor_memory():
+    if not VISITOR_MEMORY_PATH.exists():
+        return {"samples": [], "mood": {"valence": 0.0, "arousal": 0.0}}
+    try:
+        return json.loads(VISITOR_MEMORY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"samples": [], "mood": {"valence": 0.0, "arousal": 0.0}}
+
+
+def save_visitor_memory(memory):
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    VISITOR_MEMORY_PATH.write_text(
+        json.dumps(memory, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_genome():
+    if not GENOME_PATH.exists():
+        return dict(DEFAULT_GENOME)
+    try:
+        data = json.loads(GENOME_PATH.read_text(encoding="utf-8"))
+        genome = dict(DEFAULT_GENOME)
+        genome.update({key: data.get(key, value) for key, value in DEFAULT_GENOME.items()})
+        return genome
+    except Exception:
+        return dict(DEFAULT_GENOME)
+
+
+def save_genome(genome):
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    GENOME_PATH.write_text(json.dumps(genome, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def evolve_genome_from_visitor_memory(memory):
+    with genome_lock:
+        genome = load_genome()
+        samples = list((memory or {}).get("samples", []))[-80:]
+        if len(samples) < 8:
+            save_genome(genome)
+            return genome
+        valences = [float(sample.get("valence", 0.0)) for sample in samples]
+        arousals = [float(sample.get("arousal", 0.0)) for sample in samples]
+        avg_abs_valence = sum(abs(value) for value in valences) / len(valences)
+        avg_abs_arousal = sum(abs(value) for value in arousals) / len(arousals)
+        # Tiny bounded "evolution": visitor history nudges personality, never jumps.
+        target_bias_strength = 0.12 + min(0.16, avg_abs_valence * 0.12)
+        target_attack = 0.12 + min(0.12, avg_abs_arousal * 0.08)
+        genome["visitor_bias_strength"] = max(0.08, min(0.28, genome["visitor_bias_strength"] + (target_bias_strength - genome["visitor_bias_strength"]) * 0.03))
+        genome["arousal_attack"] = max(0.08, min(0.28, genome["arousal_attack"] + (target_attack - genome["arousal_attack"]) * 0.02))
+        genome["arousal_release"] = max(0.04, min(0.14, genome["arousal_release"] + ((genome["arousal_attack"] * 0.45) - genome["arousal_release"]) * 0.02))
+        genome["updated_at"] = time.time()
+        save_genome(genome)
+        return genome
+
+
+def record_parent_sample(expected_label, speaker="team"):
+    sample = record_evaluation_sample(expected_label)
+    sample["speaker"] = str(speaker or "team")
+    with parent_memory_lock:
+        memory = load_parent_memory()
+        samples = list(memory.get("samples", []))
+        samples.append(sample)
+        memory = {
+            "version": 1,
+            "updated_at": time.time(),
+            "samples": samples,
+        }
+        save_parent_memory(memory)
+    return sample
+
+
+def parent_memory_summary():
+    with parent_memory_lock:
+        samples = list(load_parent_memory().get("samples", []))
+    correct = sum(1 for sample in samples if sample.get("correct"))
+    by_label = {}
+    for sample in samples:
+        label = sample.get("expected_label", "unknown")
+        by_label[label] = by_label.get(label, 0) + 1
+    return {
+        "path": str(PARENT_MEMORY_PATH),
+        "count": len(samples),
+        "correct": correct,
+        "accuracy": round(correct / len(samples), 3) if samples else None,
+        "byLabel": by_label,
+        "samples": samples[-12:],
+    }
+
+
+def label_valence(label):
+    values = {
+        "ang": -0.8,
+        "sad": -0.7,
+        "neu": 0.0,
+        "hap": 0.8,
+    }
+    return values.get(str(label or "").strip().lower(), 0.0)
+
+
+def parent_bias_for_prediction(predicted_label, max_strength=0.35):
+    predicted = str(predicted_label or "").strip().lower()
+    if predicted not in {"ang", "sad", "neu", "hap"}:
+        return {"bias": 0.0, "strength": 0.0, "sample_count": 0}
+    with parent_memory_lock:
+        samples = [
+            sample for sample in load_parent_memory().get("samples", [])
+            if str(sample.get("predicted_label", "")).strip().lower() == predicted
+        ]
+    if len(samples) < 3:
+        return {"bias": 0.0, "strength": 0.0, "sample_count": len(samples)}
+    expected_avg = sum(label_valence(sample.get("expected_label")) for sample in samples) / len(samples)
+    predicted_valence = label_valence(predicted)
+    bias = max(-1.0, min(1.0, expected_avg - predicted_valence))
+    strength = min(float(max_strength), len(samples) / 20.0)
+    return {"bias": bias, "strength": strength, "sample_count": len(samples)}
+
+
+def apply_parent_bias(ser_result):
+    biased = dict(ser_result or {})
+    info = parent_bias_for_prediction(biased.get("label"))
+    original = float(biased.get("valence", 0.0))
+    adjusted = max(-1.0, min(1.0, original + (info["bias"] * info["strength"])))
+    biased["raw_valence"] = original
+    biased["valence"] = adjusted
+    biased["parent_bias"] = info["bias"]
+    biased["parent_bias_strength"] = info["strength"]
+    biased["parent_bias_samples"] = info["sample_count"]
+    return biased
+
+
+def update_visitor_memory(ser_result, arousal_live, arousal_confidence=0.0, now=None):
+    global last_visitor_memory_at
+    now = time.time() if now is None else float(now)
+    label = str((ser_result or {}).get("label", "unknown"))
+    confidence = float((ser_result or {}).get("confidence", 0.0))
+    if (
+        label == "unknown"
+        or confidence < 0.55
+        or float(arousal_confidence) < 0.18
+        or now - last_visitor_memory_at < 0.7
+    ):
+        return load_visitor_memory().get("mood", {"valence": 0.0, "arousal": 0.0})
+    valence = float((ser_result or {}).get("valence", 0.0))
+    arousal = float(arousal_live)
+    with visitor_memory_lock:
+        memory = load_visitor_memory()
+        mood = dict(memory.get("mood") or {})
+        old_valence = float(mood.get("valence", 0.0))
+        old_arousal = float(mood.get("arousal", 0.0))
+        # Very slow growth: visitors shape the space, but never yank TD values.
+        weight = min(0.015, max(0.0, confidence) * 0.008)
+        new_valence = max(-1.0, min(1.0, old_valence + (valence - old_valence) * weight))
+        new_arousal = max(-1.0, min(1.0, old_arousal + (arousal - old_arousal) * weight))
+        samples = list(memory.get("samples", []))
+        samples.append({
+            "timestamp": now,
+            "label": label,
+            "valence": valence,
+            "arousal": arousal,
+            "confidence": confidence,
+        })
+        del samples[:-500]
+        memory = {
+            "version": 1,
+            "updated_at": now,
+            "mood": {"valence": new_valence, "arousal": new_arousal},
+            "samples": samples,
+        }
+        save_visitor_memory(memory)
+        last_visitor_memory_at = now
+    evolve_genome_from_visitor_memory(memory)
+    return memory["mood"]
+
+
+def visitor_memory_summary():
+    with visitor_memory_lock:
+        memory = load_visitor_memory()
+    samples = list(memory.get("samples", []))
+    by_label = {}
+    for sample in samples:
+        label = sample.get("label", "unknown")
+        by_label[label] = by_label.get(label, 0) + 1
+    return {
+        "path": str(VISITOR_MEMORY_PATH),
+        "count": len(samples),
+        "mood": memory.get("mood", {"valence": 0.0, "arousal": 0.0}),
+        "byLabel": by_label,
+        "samples": samples[-12:],
+    }
+
+
+def visitor_valence_bias(visitor_mood, max_strength=0.18):
+    max_strength = float(load_genome().get("visitor_bias_strength", max_strength))
+    target = float((visitor_mood or {}).get("valence", 0.0))
+    return visitor_valence_smoother.update(max(-max_strength, min(max_strength, target * max_strength)))
+
+
+def genome_summary():
+    return {"path": str(GENOME_PATH), "genome": load_genome()}
+
+
+def evaluation_summary():
+    with evaluation_lock:
+        samples = list(evaluation_samples)
+    correct = sum(1 for sample in samples if sample["correct"])
+    return {
+        "count": len(samples),
+        "correct": correct,
+        "accuracy": round(correct / len(samples), 3) if samples else None,
+        "samples": samples[-12:],
+    }
 
 
 def run_virtual_mic_scenario(name, duration_scale=1.0, readback=False):
@@ -365,46 +657,113 @@ def send_composed_live_signal(
     return signal
 
 
+def smooth_td_arousal(arousal):
+    genome = load_genome()
+    td_arousal_smoother.attack = float(genome.get("arousal_attack", td_arousal_smoother.attack))
+    td_arousal_smoother.release = float(genome.get("arousal_release", td_arousal_smoother.release))
+    return td_arousal_smoother.update(arousal)
+
+
+def ser_arousal_hint(raw_arousal, relative_arousal):
+    return max(-1.0, min(1.0, (float(raw_arousal) * 0.4) + (float(relative_arousal) * 0.6)))
+
+
 def process_live_audio_chunk(data, overflowed=False, now=None):
+    process_start = time.perf_counter()
+    timestamp = time.time() if now is None else now
     features = backend.compute_live_audio_features(data, rate=backend.RATE)
     arousal_confidence = float(features.get("arousal_confidence", 0.0))
-    ser_result = local_ser_runtime.process(data, arousal_hint=features["arousal_live"])
-    ser_confidence = float(ser_result.get("confidence", 0.0))
-    signal = send_composed_live_signal(
+    baseline = voice_baseline.update(
+        rms=features.get("rms", 0.0),
         arousal_live=features["arousal_live"],
+        has_signal=arousal_confidence > 0.0,
+    )
+    ser_hint = ser_arousal_hint(features["arousal_live"], baseline["relative_arousal"])
+    ser_result = apply_parent_bias(local_ser_runtime.process(data, arousal_hint=ser_hint))
+    visitor_mood = update_visitor_memory(
+        ser_result,
+        features["arousal_live"],
         arousal_confidence=arousal_confidence,
-        latest_valence=float(ser_result.get("valence", 0.0)),
-        latest_valence_confidence=ser_confidence,
+        now=timestamp,
+    )
+    visitor_bias = visitor_valence_bias(visitor_mood)
+    ser_confidence = float(ser_result.get("confidence", 0.0))
+    valence_state = live_valence_tracker.update(
+        candidate_valence=max(-1.0, min(1.0, float(ser_result.get("valence", 0.0)) + visitor_bias)),
+        candidate_confidence=ser_confidence,
+        has_signal=arousal_confidence > 0.0,
+        now=timestamp,
+    )
+    signal = send_composed_live_signal(
+        arousal_live=smooth_td_arousal(features["arousal_live"]),
+        arousal_confidence=arousal_confidence,
+        latest_valence=valence_state["valence"],
+        latest_valence_confidence=valence_state["confidence"],
         ambient_valence=0.0,
         ambient_arousal=0.0,
         has_mic_activity=arousal_confidence > 0.0,
     )
     return {
         **features,
-        "timestamp": time.time() if now is None else now,
+        "processing_ms": round((time.perf_counter() - process_start) * 1000.0, 3),
+        "timestamp": timestamp,
         "overflowed": bool(overflowed),
         "valence_target": signal["valence"],
         "valence_confidence": ser_confidence,
         "ser_arousal": float(ser_result.get("arousal", features["arousal_live"])),
+        "ser_raw_valence": float(ser_result.get("raw_valence", ser_result.get("valence", 0.0))),
+        "parent_bias": float(ser_result.get("parent_bias", 0.0)),
+        "parent_bias_strength": float(ser_result.get("parent_bias_strength", 0.0)),
+        "visitor_bias": visitor_bias,
+        "visitor_mood_valence": float(visitor_mood.get("valence", 0.0)),
+        "ser_arousal_hint": ser_hint,
         "ser_confidence": ser_confidence,
         "ser_label": str(ser_result.get("label", "unknown")),
+        "ser_backend": backend.LOCAL_SER_BACKEND,
+        "valence_segment_event": valence_state["event"],
+        "valence_committed": valence_state["committed"],
+        "voice_baseline_rms": baseline["rms_baseline"],
+        "voice_relative_level": baseline["relative_level"],
+        "voice_relative_arousal": baseline["relative_arousal"],
         "serial_prefix": signal.get("serial_prefix", "v"),
     }
 
 
 def process_dual_live_audio_chunk(left_data, right_data, overflowed=False, now=None):
+    process_start = time.perf_counter()
+    timestamp = time.time() if now is None else now
     features = backend.compute_dual_live_audio_features(left_data, right_data, rate=backend.RATE)
     arousal_confidence = float(features.get("arousal_confidence", 0.0))
+    primary_rms = max(float(features.get("left_rms", 0.0)), float(features.get("right_rms", 0.0)))
+    baseline = voice_baseline.update(
+        rms=primary_rms,
+        arousal_live=features["arousal_live"],
+        has_signal=arousal_confidence > 0.0,
+    )
+    ser_hint = ser_arousal_hint(features["arousal_live"], baseline["relative_arousal"])
     primary_data = left_data
     if float(features["right_arousal_live"]) > float(features["left_arousal_live"]):
         primary_data = right_data
-    ser_result = local_ser_runtime.process(primary_data, arousal_hint=features["arousal_live"])
-    ser_confidence = float(ser_result.get("confidence", 0.0))
-    signal = compose_led_mood_signal(
-        arousal_live=features["arousal_live"],
+    ser_result = apply_parent_bias(local_ser_runtime.process(primary_data, arousal_hint=ser_hint))
+    visitor_mood = update_visitor_memory(
+        ser_result,
+        features["arousal_live"],
         arousal_confidence=arousal_confidence,
-        latest_valence=float(ser_result.get("valence", 0.0)),
-        latest_valence_confidence=ser_confidence,
+        now=timestamp,
+    )
+    visitor_bias = visitor_valence_bias(visitor_mood)
+    ser_confidence = float(ser_result.get("confidence", 0.0))
+    valence_state = live_valence_tracker.update(
+        candidate_valence=max(-1.0, min(1.0, float(ser_result.get("valence", 0.0)) + visitor_bias)),
+        candidate_confidence=ser_confidence,
+        has_signal=arousal_confidence > 0.0,
+        now=timestamp,
+    )
+    signal = compose_led_mood_signal(
+        arousal_live=smooth_td_arousal(features["arousal_live"]),
+        arousal_confidence=arousal_confidence,
+        latest_valence=valence_state["valence"],
+        latest_valence_confidence=valence_state["confidence"],
         ambient_valence=0.0,
         ambient_arousal=0.0,
         has_mic_activity=arousal_confidence > 0.0,
@@ -421,13 +780,26 @@ def process_dual_live_audio_chunk(left_data, right_data, overflowed=False, now=N
     )
     return {
         **features,
-        "timestamp": time.time() if now is None else now,
+        "processing_ms": round((time.perf_counter() - process_start) * 1000.0, 3),
+        "timestamp": timestamp,
         "overflowed": bool(overflowed),
         "valence_target": signal["valence"],
         "valence_confidence": ser_confidence,
         "ser_arousal": float(ser_result.get("arousal", features["arousal_live"])),
+        "ser_raw_valence": float(ser_result.get("raw_valence", ser_result.get("valence", 0.0))),
+        "parent_bias": float(ser_result.get("parent_bias", 0.0)),
+        "parent_bias_strength": float(ser_result.get("parent_bias_strength", 0.0)),
+        "visitor_bias": visitor_bias,
+        "visitor_mood_valence": float(visitor_mood.get("valence", 0.0)),
+        "ser_arousal_hint": ser_hint,
         "ser_confidence": ser_confidence,
         "ser_label": str(ser_result.get("label", "unknown")),
+        "ser_backend": backend.LOCAL_SER_BACKEND,
+        "valence_segment_event": valence_state["event"],
+        "valence_committed": valence_state["committed"],
+        "voice_baseline_rms": baseline["rms_baseline"],
+        "voice_relative_level": baseline["relative_level"],
+        "voice_relative_arousal": baseline["relative_arousal"],
         "serial_prefix": signal.get("serial_prefix", "v"),
         "live_input_mode": "dual_devices",
         "left_device": backend.LEFT_DEVICE,
@@ -529,6 +901,9 @@ def start_live():
     state = get_live()
     if state.get("running"):
         return False, state
+    live_valence_tracker.reset()
+    td_arousal_smoother.value = 0.0
+    voice_baseline.reset()
     live_stop_event.clear()
     live_thread = threading.Thread(target=live_worker, daemon=True)
     live_thread.start()
@@ -588,6 +963,18 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
             return
+        if self.path == "/api/evaluation":
+            self.send_json({"ok": True, **evaluation_summary()})
+            return
+        if self.path == "/api/parent-memory":
+            self.send_json({"ok": True, **parent_memory_summary()})
+            return
+        if self.path == "/api/visitor-memory":
+            self.send_json({"ok": True, **visitor_memory_summary()})
+            return
+        if self.path == "/api/genome":
+            self.send_json({"ok": True, **genome_summary()})
+            return
         if self.path == "/api/health":
             self.send_json({
                 "ok": True,
@@ -622,6 +1009,27 @@ class Handler(SimpleHTTPRequestHandler):
 
         if self.path == "/api/live/stop":
             self.send_json({"ok": True, "state": stop_live()})
+            return
+
+        if self.path == "/api/evaluation/record":
+            try:
+                body = self.read_json()
+                sample = record_evaluation_sample(body.get("expectedLabel"))
+                self.send_json({"ok": True, "sample": sample, **evaluation_summary()})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+
+        if self.path == "/api/parent-memory/record":
+            try:
+                body = self.read_json()
+                sample = record_parent_sample(
+                    body.get("expectedLabel"),
+                    speaker=body.get("speaker", "team"),
+                )
+                self.send_json({"ok": True, "sample": sample, **parent_memory_summary()})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
 
         if self.path == "/api/virtual-mic/run":
